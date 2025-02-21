@@ -1,443 +1,463 @@
-import React, { useRef, useState, useEffect, useCallback } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import * as faceapi from 'face-api.js';
 
-const PassportPhotoEditor = () => {
-    const originalCanvasRef = useRef(null);
-    const croppedCanvasRef = useRef(null);
-    const [originalImage, setOriginalImage] = useState(null);
-    const [faceDetection, setFaceDetection] = useState(null);
-    const [isLoading, setIsLoading] = useState(true);
-    const [cropRegion, setCropRegion] = useState({ x: 0, y: 0, width: 0, height: 0 });
-    const [isDragging, setIsDragging] = useState(false);
-    const [resizeHandle, setResizeHandle] = useState(null);
-    const [aspectRatio, setAspectRatio] = useState(3 / 4); // Default 3:4
-    const [zoomLevel, setZoomLevel] = useState(1);
-    const [rotationAngle, setRotationAngle] = useState(0);
-    const [headSizeGuide, setHeadSizeGuide] = useState({ min: 0.4, max: 0.5 }); // Example head size guide
-    const [showGuides, setShowGuides] = useState(true);
-    const [selectedAspectRatioPreset, setSelectedAspectRatioPreset] = useState('3:4');
-    const aspectRatioPresets = {
-        '3:4': 3 / 4,
-        '4:5': 4 / 5,
-        '1:1': 1,
-        'custom': null, // Will use customAspectRatio state
-    };
-    const [customAspectRatio, setCustomAspectRatio] = useState('');
-    const [isAspectRatioCustom, setIsAspectRatioCustom] = useState(false);
+// Constants for Passport Photo Requirements and UI
+const PASSPORT_DPI = 600;
+const PASSPORT_WIDTH_MM = 35;
+const PASSPORT_HEIGHT_MM = 45;
+const HEAD_HEIGHT_MIN_MM = 32;
+const HEAD_HEIGHT_MAX_MM = 36;
+const TOP_MARGIN_MM = 3.5;
+const EYE_ANGLE_TOLERANCE_DEGREES = 10;
+const MIN_IMAGE_RESOLUTION = 600;
+const MODEL_URI = '/models'; // Define model URI once
+const ZOOM_STEP = 0.01; // Step for zoom buttons and range input
+const VERTICAL_STEP = 1; // Step for vertical move buttons and range input
+const HORIZONTAL_STEP = 1; // Step for horizontal move buttons and range input
+const MAX_VERTICAL_OFFSET = 50; // Maximum vertical offset in pixels (adjust as needed)
+const MIN_VERTICAL_OFFSET = -50; // Minimum vertical offset in pixels (adjust as needed)
+const MAX_HORIZONTAL_OFFSET = 50; // Maximum horizontal offset in pixels (adjust as needed)
+const MIN_HORIZONTAL_OFFSET = -50; // Minimum horizontal offset in pixels (adjust as needed)
+const MAX_ZOOM_FACTOR = 0.4;
+const MIN_ZOOM_FACTOR = 0;
 
 
-    // Load face detection models
-    useEffect(() => {
-        const loadModels = async () => {
-            try {
-                await Promise.all([
-                    faceapi.nets.tinyFaceDetector.loadFromUri('/models'),
-                    faceapi.nets.faceLandmark68Net.loadFromUri('/models'),
-                ]);
-                setIsLoading(false);
-            } catch (err) {
-                console.error("Model load error:", err);
-                alert("Failed to load face detection models. Please check the /models directory and console for details.");
-            }
-        };
-        loadModels();
-    }, []);
-
-    // Handle image upload
-    const handleImageUpload = async (event) => {
-        setFaceDetection(null);
-        setOriginalImage(null);
-        setCropRegion({ x: 0, y: 0, width: 0, height: 0 }); // Reset crop region
-        setZoomLevel(1); // Reset zoom
-        setRotationAngle(0); // Reset rotation
-
-        const file = event.target.files[0];
-        if (!file) return;
-
-        const img = new Image();
-        img.src = URL.createObjectURL(file);
-        img.onload = async () => {
-            if (img.width < 600 || img.height < 600) {
-                alert("Image resolution is too low. Please upload a higher-quality image (min 600x600).");
-                return;
-            }
-
-            setOriginalImage(img);
-            const canvas = originalCanvasRef.current;
-            if (!canvas) return;
-
-            canvas.width = img.width;
-            canvas.height = img.height;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0, img.width, img.height);
-
-            if (!faceapi.nets.tinyFaceDetector.isLoaded) {
-                alert("Face detection model not loaded yet. Please wait.");
-                return;
-            }
-
-            const detectionOptions = new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 });
-            const detection = await faceapi.detectSingleFace(canvas, detectionOptions).withFaceLandmarks();
-
-            if (detection) {
-                const faceBox = detection.detection.box;
-                const landmarks = detection.landmarks.positions;
-                const eyeLeft = landmarks[36];
-                const eyeRight = landmarks[45];
-                const eyeMidpointX = (eyeLeft.x + eyeRight.x) / 2;
-                const eyeMidpointY = (eyeLeft.y + eyeRight.y) / 2;
-
-                const cropWidth = Math.min(faceBox.width * 1.8, img.width); // Slightly wider initial crop
-                const currentAspectRatio = isAspectRatioCustom && customAspectRatio ? parseFloat(customAspectRatio) : aspectRatioPresets[selectedAspectRatioPreset];
-                const cropHeight = currentAspectRatio ? cropWidth / currentAspectRatio : cropWidth / aspectRatio;
-
-
-                setCropRegion({
-                    x: Math.max(0, eyeMidpointX - cropWidth / 2), // Center X around eye midpoint
-                    y: Math.max(0, eyeMidpointY - cropHeight / 2 - faceBox.height * 0.2), // Center Y slightly above eye midpoint
-                    width: cropWidth,
-                    height: cropHeight,
-                });
-                setFaceDetection(detection);
-
-            } else {
-                alert("No face detected. Please upload another photo where the face is clearly visible and well-lit.");
-            }
-        };
-
-        img.onerror = () => {
-            alert("Error loading image. Please try another image file.");
-        };
-    };
-
-    // Update cropped canvas whenever cropRegion, originalImage, faceDetection, etc. changes
-    useEffect(() => {
-        const updateCroppedCanvas = () => {
-            if (!originalImage || !faceDetection) return;
-
-            const croppedCanvas = croppedCanvasRef.current;
-            if (!croppedCanvas) return;
-
-            const dpi = 300;
-            const passportWidthPx = Math.round((35 / 25.4) * dpi);
-            const passportHeightPx = Math.round((45 / 25.4) * dpi);
-
-            croppedCanvas.width = passportWidthPx;
-            croppedCanvas.height = passportHeightPx;
-            const croppedCtx = croppedCanvas.getContext('2d');
-            croppedCtx.clearRect(0, 0, passportWidthPx, passportHeightPx); // Clear canvas before drawing
-
-            croppedCtx.save(); // Save context to apply zoom and rotation
-            croppedCtx.translate(passportWidthPx / 2, passportHeightPx / 2); // Translate to center for rotation/zoom
-            croppedCtx.rotate(rotationAngle * Math.PI / 180);
-            croppedCtx.scale(zoomLevel, zoomLevel);
-            croppedCtx.translate(-passportWidthPx / 2, -passportHeightPx / 2); // Translate back
-
-            croppedCtx.drawImage(
-                originalCanvasRef.current,
-                cropRegion.x, cropRegion.y, cropRegion.width, cropRegion.height,
-                0, 0, passportWidthPx, passportHeightPx
-            );
-            croppedCtx.restore(); // Restore context to remove zoom and rotation
-
-            if (showGuides) {
-                drawGuides(croppedCtx, passportWidthPx, passportHeightPx);
-            }
-
-        };
-        updateCroppedCanvas();
-    }, [originalImage, faceDetection, cropRegion, zoomLevel, rotationAngle, showGuides]);
-
-    const drawGuides = (ctx, canvasWidth, canvasHeight) => {
-        ctx.strokeStyle = 'red';
-        ctx.lineWidth = 1;
-
-        // Head size guide (example - adjust values as needed based on guidelines)
-        const minHeadHeight = canvasHeight * headSizeGuide.min;
-        const maxHeadHeight = canvasHeight * headSizeGuide.max;
-        ctx.beginPath();
-        ctx.moveTo(0, canvasHeight - maxHeadHeight);
-        ctx.lineTo(canvasWidth, canvasHeight - maxHeadHeight);
-        ctx.moveTo(0, canvasHeight - minHeadHeight);
-        ctx.lineTo(canvasWidth, canvasHeight - minHeadHeight);
-        ctx.stroke();
-
-         // Eye line guide (example - adjust vertical position as needed)
-        const eyeLineY = canvasHeight * 0.35; // Example: Eyes at 35% from top
-        ctx.beginPath();
-        ctx.strokeStyle = 'green';
-        ctx.moveTo(0, eyeLineY);
-        ctx.lineTo(canvasWidth, eyeLineY);
-        ctx.stroke();
-    };
-
-
-    // Drag and resize logic - improved with aspect ratio constraint
-    const handleMouseDown = (e) => {
-        if (!faceDetection) return; // Prevent dragging/resizing if no face detected
-
-        const rect = originalCanvasRef.current.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-        const { x, y, width, height } = cropRegion;
-
-        const resizeHandleSize = 20; // Increased resize handle size for easier interaction
-
-        if (
-            mouseX > x + width - resizeHandleSize &&
-            mouseX < x + width + resizeHandleSize &&
-            mouseY > y + height - resizeHandleSize &&
-            mouseY < y + height + resizeHandleSize
-        ) {
-            setResizeHandle('bottom-right');
-        } else if (mouseX > x && mouseX < x + width && mouseY > y && mouseY < y + height) {
-            setIsDragging(true);
-        }
-    };
-
-    const handleMouseMove = (e) => {
-        if (!isDragging && !resizeHandle || !originalImage) return;
-
-        const rect = originalCanvasRef.current.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-        const { x, y, width, height } = cropRegion;
-        const currentAspectRatio = isAspectRatioCustom && customAspectRatio ? parseFloat(customAspectRatio) : aspectRatioPresets[selectedAspectRatioPreset];
-
-
-        if (isDragging) {
-            setCropRegion({
-                x: Math.max(0, Math.min(mouseX - width / 2, originalImage.width - width)),
-                y: Math.max(0, Math.min(mouseY - height / 2, originalImage.height - height)),
-                width,
-                height,
-            });
-        } else if (resizeHandle === 'bottom-right') {
-            let newWidth = Math.max(50, mouseX - x);
-            let newHeight = currentAspectRatio ? newWidth / currentAspectRatio : newWidth / aspectRatio;
-
-             // Keep crop region within image bounds during resize
-            if (x + newWidth > originalImage.width) {
-                newWidth = originalImage.width - x;
-                if (currentAspectRatio) newHeight = newWidth / currentAspectRatio; else newHeight = newWidth / aspectRatio;
-            }
-            if (y + newHeight > originalImage.height) {
-                 newHeight = originalImage.height - y;
-                 if (currentAspectRatio) newWidth = currentAspectRatio ? newHeight * currentAspectRatio: newHeight * aspectRatio; else newWidth = newHeight * aspectRatio;
-                 if (x + newWidth > originalImage.width) newWidth = originalImage.width - x; //Re-adjust width if height limit caused width overflow again
-            }
-
-
-            setCropRegion({
-                x,
-                y,
-                width: newWidth,
-                height: newHeight,
-            });
-        }
-    };
-
-    const handleMouseUp = () => {
-        setIsDragging(false);
-        setResizeHandle(null);
-    };
-
-
-    const handleZoomChange = (e) => {
-        setZoomLevel(parseFloat(e.target.value));
-    };
-
-    const handleRotationChange = (e) => {
-        setRotationAngle(parseFloat(e.target.value));
-    };
-    const handleToggleGuides = () => {
-        setShowGuides(!showGuides);
-    };
-
-    const handleAspectRatioPresetChange = (e) => {
-        setSelectedAspectRatioPreset(e.target.value);
-        setIsAspectRatioCustom(e.target.value === 'custom');
-        if (e.target.value !== 'custom') {
-            setAspectRatio(aspectRatioPresets[e.target.value]);
-        }
-    };
-
-    const handleCustomAspectRatioChange = (e) => {
-        setCustomAspectRatio(e.target.value);
-        if (isAspectRatioCustom && e.target.value) {
-            setAspectRatio(parseFloat(e.target.value));
-        } else if (!isAspectRatioCustom) {
-            setAspectRatio(aspectRatioPresets[selectedAspectRatioPreset]); //Revert to preset if custom is unchecked
-        }
-    };
-    const handleCustomAspectRatioCheckboxChange = (e) => {
-        setIsAspectRatioCustom(e.target.checked);
-        if (e.target.checked && customAspectRatio) {
-             setAspectRatio(parseFloat(customAspectRatio));
-        } else if (!e.target.checked) {
-            setAspectRatio(aspectRatioPresets[selectedAspectRatioPreset]); //Revert to preset
-        }
-    };
-
-
-    // Download cropped passport photo
-    const handleDownload = (format = 'jpeg') => {
-        if (!faceDetection || isLoading) {
-            alert("Please upload an image and wait for face detection to complete.");
-            return;
-        }
-        const croppedCanvas = croppedCanvasRef.current;
-        if (!croppedCanvas) return;
-
-        const link = document.createElement('a');
-        link.href = croppedCanvas.toDataURL(`image/${format}`, format === 'jpeg' ? 0.9 : 1); // JPEG quality 0.9
-        link.download = `passport-photo.${format}`;
-        link.click();
-    };
-
-    return (
-        <div>
-            <h1>Passport Photo Editor</h1>
-            <input
-                type="file"
-                accept="image/*"
-                onChange={handleImageUpload}
-                disabled={isLoading}
-                style={{ display: 'block', margin: '20px auto' }}
-            />
-            {isLoading && <p>Loading face detection models...</p>}
-
-            <div style={{ margin: '20px auto', textAlign: 'center' }}>
-                <label htmlFor="aspectRatioPreset">Aspect Ratio Preset:</label>
-                <select id="aspectRatioPreset" value={selectedAspectRatioPreset} onChange={handleAspectRatioPresetChange} style={{ margin: '0 10px' }}>
-                    {Object.keys(aspectRatioPresets).filter(key => key !== 'custom').map(key => (
-                        <option key={key} value={key}>{key}</option>
-                    ))}
-                     <option value="custom">Custom</option>
-                </select>
-
-                {selectedAspectRatioPreset === 'custom' && (
-                    <>
-                         <label htmlFor="customAspectRatio" style={{ margin: '0 10px' }}>Custom Ratio:</label>
-                        <input
-                            type="number"
-                            id="customAspectRatio"
-                            value={customAspectRatio}
-                            onChange={handleCustomAspectRatioChange}
-                            placeholder="e.g., 0.75 (for 3:4)"
-                            step="0.01"
-                            style={{ width: '80px', margin: '0 10px' }}
-                            disabled={!isAspectRatioCustom}
-
-                        />
-                        <label>
-                           <input
-                                type="checkbox"
-                                checked={isAspectRatioCustom}
-                                onChange={handleCustomAspectRatioCheckboxChange}
-                                style={{ margin: '0 5px' }}
-                            />
-                            Use Custom Ratio
-                        </label>
-                    </>
-                )}
-
-
-                <label htmlFor="zoomLevel" style={{ margin: '0 10px' }}>Zoom:</label>
-                <input
-                    type="range"
-                    id="zoomLevel"
-                    min="0.5"
-                    max="2"
-                    step="0.05"
-                    value={zoomLevel}
-                    onChange={handleZoomChange}
-                    style={{ width: '100px', margin: '0 10px' }}
-                />
-                <span style={{ margin: '0 10px' }}>{zoomLevel.toFixed(2)}x</span>
-
-                <label htmlFor="rotationAngle" style={{ margin: '0 10px' }}>Rotation:</label>
-                <input
-                    type="range"
-                    id="rotationAngle"
-                    min="-10"
-                    max="10"
-                    step="1"
-                    value={rotationAngle}
-                    onChange={handleRotationChange}
-                    style={{ width: '100px', margin: '0 10px' }}
-                />
-                <span>{rotationAngle}°</span>
-                <button onClick={handleToggleGuides} style={{ margin: '0 10px' }}>
-                    {showGuides ? 'Hide Guides' : 'Show Guides'}
-                </button>
-
-            </div>
-
-
-            <div className="preview-container">
-                <div className="preview-box">
-                    <h3>Original Image</h3>
-                    <div
-                        className="image-container"
-                        style={{ position: 'relative' }}
-                        onMouseDown={handleMouseDown}
-                        onMouseMove={handleMouseMove}
-                        onMouseUp={handleMouseUp}
-                        onMouseLeave={handleMouseUp}
-                    >
-                        <canvas ref={originalCanvasRef} style={{ maxWidth: '100%', height: 'auto' }} />
-                        {faceDetection && (
-                            <div
-                                className="crop-box"
-                                style={{
-                                    position: 'absolute',
-                                    left: `${cropRegion.x}px`,
-                                    top: `${cropRegion.y}px`,
-                                    width: `${cropRegion.width}px`,
-                                    height: `${cropRegion.height}px`,
-                                    border: '2px solid blue',
-                                    boxSizing: 'border-box',
-                                    pointerEvents: 'none',
-                                }}
-                            >
-                                {/* Resize handle */}
-                                <div
-                                    style={{
-                                        position: 'absolute',
-                                        right: '-10px',
-                                        bottom: '-10px',
-                                        width: '20px',
-                                        height: '20px',
-                                        backgroundColor: 'blue',
-                                        cursor: 'nwse-resize',
-                                    }}
-                                ></div>
-                            </div>
-                        )}
-                    </div>
-                </div>
-                <div className="preview-box">
-                    <h3>Cropped Passport Photo (35mm x 45mm)</h3>
-                    <canvas ref={croppedCanvasRef} style={{ border: '1px solid black', maxWidth: '100%' }} />
-                </div>
-            </div>
-            <div className="button-group">
-                <button onClick={() => handleDownload('jpeg')} disabled={!faceDetection || isLoading}>
-                    Crop & Download JPEG
-                </button>
-                <button onClick={() => handleDownload('png')} disabled={!faceDetection || isLoading}>
-                    Crop & Download PNG
-                </button>
-            </div>
-             <p style={{marginTop: '20px', fontSize: '0.9em', color: 'grey'}}>
-                * Adjust the crop box on the "Original Image" to fine-tune your passport photo. <br/>
-                * Use the zoom and rotation controls above for further adjustments. <br/>
-                * 'Show Guides' toggles visual aids on the Cropped Passport Photo to help with alignment and sizing based on common guidelines. <br/>
-                * For best results, upload a high-resolution image with clear, frontal face and good lighting.
-            </p>
-        </div>
-    );
+// --- Styles as CSS objects for better readability ---
+const containerStyle = {
+    padding: '20px',
+    fontFamily: 'Arial, sans-serif'
 };
 
-export default PassportPhotoEditor;
+const errorStyle = {
+    color: 'red',
+    textAlign: 'center'
+};
+
+const inputContainerStyle = {
+    textAlign: 'center',
+    marginBottom: '20px'
+};
+
+const canvasesContainerStyle = {
+    display: 'flex',
+    justifyContent: 'center',
+    gap: '20px',
+    flexWrap: 'wrap'
+};
+
+const canvasWrapperStyle = {
+    position: 'relative',
+    width: '100%',
+    overflow: 'hidden'
+};
+
+const canvasStyle = {
+    display: 'block',
+    maxWidth: '99%',
+    height: 'auto',
+    border: '1px solid black'
+};
+
+const downloadButtonStyle = {
+    padding: '10px 20px',
+    backgroundColor: '#007bff',
+    color: 'white',
+    border: 'none',
+    borderRadius: '5px',
+    cursor: 'pointer',
+    fontSize: '16px',
+};
+
+const noteStyle = {
+    marginTop: '20px',
+    fontSize: '0.9em',
+    color: 'grey',
+    textAlign: 'center'
+};
+
+const controlsContainerStyle = { // Container for Zoom, Vertical and Horizontal controls
+    textAlign: 'center',
+    marginTop: '20px',
+    marginBottom: '20px',
+    display: 'flex',
+    flexDirection: 'column', // Stack controls vertically
+    alignItems: 'center',
+};
+
+
+const controlGroupStyle = { // Style for each control group
+    display: 'flex',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: '10px', // Space between control groups
+};
+
+
+const controlButtonStyle = { // Reusable style for buttons in controls
+    padding: '8px 15px',
+    backgroundColor: '#f0f0f0',
+    color: '#333',
+    border: '1px solid #ccc',
+    borderRadius: '5px',
+    cursor: 'pointer',
+    fontSize: '14px',
+    margin: '0 5px'
+};
+
+const controlRangeStyle = { // Reusable style for range inputs in controls
+    margin: '0 10px',
+    width: '150px'
+};
+
+const resetButtonContainerStyle = {
+    marginTop: '20px',
+    textAlign: 'center'
+};
+
+
+const PakistaniPassportPhotoEditor = () => {
+    const originalCanvasRef = useRef(null);
+    const croppedCanvasRef = useRef(null);
+    const [originalImage, setOriginalImage] = useState(null);
+    const [faceDetection, setFaceDetection] = useState(null);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [zoomFactor, setZoomFactor] = useState(0.2); // Initialize zoomFactor state
+    const [verticalOffset, setVerticalOffset] = useState(0); // Initialize verticalOffset state
+    const [horizontalOffset, setHorizontalOffset] = useState(0); // Initialize horizontalOffset state
+
+
+    // Load face detection models
+    useEffect(() => {
+        const loadModels = async () => {
+            try {
+                await Promise.all([
+                    faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URI),
+                    faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URI),
+                    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URI),
+                ]);
+                setIsLoading(false);
+            } catch (err) {
+                console.error("Model load error:", err);
+                setError("Failed to load face detection models. Please check the /models directory and console for details.");
+            }
+        };
+        loadModels();
+    }, []);
+
+    // Handle image upload
+    const handleImageUpload = async (event) => {
+        setError(null);
+        setFaceDetection(null);
+        setOriginalImage(null);
+        setVerticalOffset(0); // Reset vertical offset on new image upload
+        setHorizontalOffset(0); // Reset horizontal offset on new image upload
+        setZoomFactor(0.2); // Reset zoom factor on new image upload
+
+        const file = event.target.files[0];
+        if (!file) return;
+
+        const img = new Image();
+        img.src = URL.createObjectURL(file);
+        img.onload = async () => {
+            if (img.width < MIN_IMAGE_RESOLUTION || img.height < MIN_IMAGE_RESOLUTION) {
+                setError(`Image resolution is too low. Please upload a higher-quality image (min ${MIN_IMAGE_RESOLUTION}x${MIN_IMAGE_RESOLUTION}).`);
+                return;
+            }
+
+            setOriginalImage(img);
+            const canvas = originalCanvasRef.current;
+            if (!canvas) return;
+
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, img.width, img.height);
+
+            if (!faceapi.nets.tinyFaceDetector.isLoaded) {
+                setError("Face detection model not loaded yet. Please wait.");
+                return;
+            }
+
+            try {
+                const detectionOptions = new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.5 });
+                const detection = await faceapi.detectSingleFace(canvas, detectionOptions).withFaceLandmarks().withFaceDescriptor();
+
+                if (!detection) {
+                    setError("No face detected. Please upload another photo where the face is clearly visible and well-lit.");
+                    return;
+                }
+
+                // Check if the person is looking at the camera
+                const landmarks = detection.landmarks;
+                const leftEye = landmarks.getLeftEye();
+                const rightEye = landmarks.getRightEye();
+
+                const eyeLineVector = {
+                    x: rightEye[0].x - leftEye[0].x,
+                    y: rightEye[0].y - leftEye[0].y,
+                };
+                const angle = Math.atan2(eyeLineVector.y, eyeLineVector.x) * 180 / Math.PI;
+
+                if (Math.abs(angle) > EYE_ANGLE_TOLERANCE_DEGREES) {
+                    setError("Please look directly at the camera.");
+                    return;
+                }
+                setFaceDetection(detection);
+
+            } catch (err) {
+                console.error("Face detection error:", err);
+                setError("An error occurred during face detection.");
+            }
+        };
+
+        img.onerror = () => {
+            setError("Error loading image. Please try another image file.");
+        };
+    };
+
+
+    // Update cropped canvas
+    useEffect(() => {
+        if (!originalImage || !faceDetection) return;
+
+        const croppedCanvas = croppedCanvasRef.current;
+        if (!croppedCanvas) return;
+
+        const dpi = PASSPORT_DPI;
+        const passportWidthPx = Math.round((PASSPORT_WIDTH_MM / 25.4) * dpi);
+        const passportHeightPx = Math.round((PASSPORT_HEIGHT_MM / 25.4) * dpi);
+
+        croppedCanvas.width = passportWidthPx;
+        croppedCanvas.height = passportHeightPx;
+        const croppedCtx = croppedCanvas.getContext('2d');
+        croppedCtx.clearRect(0, 0, passportWidthPx, passportHeightPx);
+
+
+        const landmarks = faceDetection.landmarks;
+        const chin = landmarks.positions[8];
+        const topOfHead = getTopOfHead(faceDetection, zoomFactor); // Pass zoomFactor to getTopOfHead
+
+
+        const minHeadHeightPx = Math.round((HEAD_HEIGHT_MIN_MM / 25.4) * dpi);
+        const maxHeadHeightPx = Math.round((HEAD_HEIGHT_MAX_MM / 25.4) * dpi);
+        const targetHeadHeightPx = (minHeadHeightPx + maxHeadHeightPx) / 2;
+        const actualHeadHeightPx = chin.y - topOfHead.y;
+        const scale = targetHeadHeightPx / actualHeadHeightPx;
+        const topMarginPx = Math.round((TOP_MARGIN_MM / 25.4) * dpi);
+        const scaledTopOfHeadY = topOfHead.y * scale;
+        const offsetY = topMarginPx - scaledTopOfHeadY + verticalOffset; // Add verticalOffset to offsetY
+        // Incorporate horizontalOffset here:
+        const faceCenterX = faceDetection.detection.box.x + faceDetection.detection.box.width / 2;
+        const scaledFaceCenterX = faceCenterX * scale;
+        const offsetX = (passportWidthPx / 2) - scaledFaceCenterX + horizontalOffset; // Add horizontalOffset to offsetX
+
+
+        croppedCtx.drawImage(
+            originalCanvasRef.current,
+            0, 0, originalImage.width, originalImage.height,
+            offsetX, offsetY, originalImage.width * scale, originalImage.height * scale
+        );
+
+    }, [originalImage, faceDetection, zoomFactor, verticalOffset, horizontalOffset]); // useEffect depends on horizontalOffset
+
+
+    // Helper Function: Estimate Top of Head (Original Version - Adjustable Offset from Zoom)
+    const getTopOfHead = (detection, currentZoomFactor) => { //Accept zoomFactor as argument
+        const landmarks = detection.landmarks;
+        const noseTip = landmarks.getNose()[3];
+        const {  y, height } = detection.detection.box;
+
+        // Use zoomFactor to adjust head top estimation
+        const headTopY = Math.max(0, y - (height * currentZoomFactor)); // Use currentZoomFactor here
+        return { x: noseTip.x, y: headTopY };
+    };
+
+    // Zoom Controls Handlers
+    const handleZoomChange = (event) => {
+        setZoomFactor(parseFloat(event.target.value));
+    };
+
+    const handleZoomIn = () => {
+        setZoomFactor(prevZoom => Math.min(prevZoom + ZOOM_STEP, MAX_ZOOM_FACTOR)); // Example max zoomFactor 0.4
+    };
+
+    const handleZoomOut = () => {
+        setZoomFactor(prevZoom => Math.max(prevZoom - ZOOM_STEP, MIN_ZOOM_FACTOR)); // Example min zoomFactor 0
+    };
+
+    // Vertical Move Controls Handlers
+    const handleVerticalOffsetChange = (event) => {
+        setVerticalOffset(parseInt(event.target.value, 10));
+    };
+
+    const handleMoveUp = () => {
+        setVerticalOffset(prevOffset => Math.min(prevOffset + VERTICAL_STEP, MAX_VERTICAL_OFFSET));
+    };
+
+    const handleMoveDown = () => {
+        setVerticalOffset(prevOffset => Math.max(prevOffset - VERTICAL_STEP, MIN_VERTICAL_OFFSET));
+    };
+
+    // Horizontal Move Controls Handlers
+    const handleHorizontalOffsetChange = (event) => {
+        setHorizontalOffset(parseInt(event.target.value, 10));
+    };
+
+    const handleMoveLeft = () => {
+        setHorizontalOffset(prevOffset => Math.min(prevOffset + HORIZONTAL_STEP, MAX_HORIZONTAL_OFFSET));
+    };
+
+    const handleMoveRight = () => {
+        setHorizontalOffset(prevOffset => Math.max(prevOffset - HORIZONTAL_STEP, MIN_HORIZONTAL_OFFSET));
+    };
+
+    // Reset All Controls Handler
+    const handleReset = () => {
+        setZoomFactor(0.2);
+        setVerticalOffset(0);
+        setHorizontalOffset(0);
+    };
+
+    // Auto-Fit Head Size Handler
+    const handleAutoFitHeadSize = () => {
+        if (!faceDetection || !originalImage) return;
+
+        const landmarks = faceDetection.landmarks;
+        const chin = landmarks.positions[8];
+        const topOfHeadEstimate = getTopOfHead(faceDetection, zoomFactor); // Use current zoomFactor for initial estimate
+        const actualHeadHeightPx = chin.y - topOfHeadEstimate.y;
+
+        const dpi = PASSPORT_DPI;
+        const minHeadHeightPx = Math.round((HEAD_HEIGHT_MIN_MM / 25.4) * dpi);
+        const maxHeadHeightPx = Math.round((HEAD_HEIGHT_MAX_MM / 25.4) * dpi);
+        const targetHeadHeightPx = (minHeadHeightPx + maxHeadHeightPx) / 2;
+
+
+        let calculatedZoom = targetHeadHeightPx / actualHeadHeightPx;
+        calculatedZoom = Math.min(Math.max(calculatedZoom, MIN_ZOOM_FACTOR), MAX_ZOOM_FACTOR); // Constrain zoom
+
+        setZoomFactor(calculatedZoom);
+        setVerticalOffset(0); // Reset vertical offset when auto-fitting zoom
+        setHorizontalOffset(0); // Reset horizontal offset when auto-fitting zoom
+    };
+
+
+    // Download cropped passport photo
+    const handleDownload = () => {
+        if (!faceDetection) {
+            alert("Please upload an image and wait for face detection to complete.");
+            return;
+        }
+        const croppedCanvas = croppedCanvasRef.current;
+        if (!croppedCanvas) return;
+
+        const link = document.createElement('a');
+        link.href = croppedCanvas.toDataURL('image/jpeg', 0.95);
+        link.download = 'pakistani-passport-photo.jpg';
+        link.click();
+    };
+
+    return (
+        <div style={containerStyle}>
+            <h1 style={{ textAlign: 'center', marginBottom: '20px' }}>Pakistani Passport Photo Editor</h1>
+            {error && <p style={errorStyle}>{error}</p>}
+            <div style={inputContainerStyle}>
+                <input
+                    type="file"
+                    accept="image/*"
+                    onChange={handleImageUpload}
+                    disabled={isLoading}
+                    style={{ display: 'block', margin: '0 auto' }}
+                />
+                {isLoading && <p>Loading face detection models...</p>}
+            </div>
+
+            <div style={controlsContainerStyle}>
+
+                <div style={controlGroupStyle}>
+                    <button style={controlButtonStyle} onClick={handleZoomOut}>Zoom Out</button>
+                    <input
+                        type="range"
+                        min={MIN_ZOOM_FACTOR}
+                        max={MAX_ZOOM_FACTOR}
+                        step={ZOOM_STEP}
+                        value={zoomFactor}
+                        onChange={handleZoomChange}
+                        style={controlRangeStyle}
+                    />
+                    <button style={controlButtonStyle} onClick={handleZoomIn}>Zoom In</button>
+                </div>
+
+                <div style={controlGroupStyle}>
+                    <button style={controlButtonStyle} onClick={handleMoveDown}>Move Down</button>
+                    <input
+                        type="range"
+                        min={MIN_VERTICAL_OFFSET}
+                        max={MAX_VERTICAL_OFFSET}
+                        step={VERTICAL_STEP}
+                        value={verticalOffset}
+                        onChange={handleVerticalOffsetChange}
+                        style={controlRangeStyle}
+                    />
+                    <button style={controlButtonStyle} onClick={handleMoveUp}>Move Up</button>
+                </div>
+
+                <div style={controlGroupStyle}>
+                    <button style={controlButtonStyle} onClick={handleMoveLeft}>Move Left</button>
+                    <input
+                        type="range"
+                        min={MIN_HORIZONTAL_OFFSET}
+                        max={MAX_HORIZONTAL_OFFSET}
+                        step={HORIZONTAL_STEP}
+                        value={horizontalOffset}
+                        onChange={handleHorizontalOffsetChange}
+                        style={controlRangeStyle}
+                    />
+                    <button style={controlButtonStyle} onClick={handleMoveRight}>Move Right</button>
+                </div>
+
+                    <div style={resetButtonContainerStyle}>
+                        <button style={downloadButtonStyle} onClick={handleReset}>Reset All</button>
+                    </div>
+
+                    <div style={resetButtonContainerStyle}>
+                        <button style={downloadButtonStyle} onClick={handleAutoFitHeadSize}>Auto-Fit Head Size</button>
+                    </div>
+
+
+            </div>
+
+
+            <div style={canvasesContainerStyle}>
+                <div style={{ flex: '1 1 400px', minWidth: '300px', maxWidth: '600px' }}>
+                    <h3>Original Image</h3>
+                    <div style={canvasWrapperStyle}>
+                        <canvas ref={originalCanvasRef} style={canvasStyle} />
+                    </div>
+                </div>
+                <div style={{ flex: '1 1 200px', minWidth: '150px', maxWidth: '300px' }}>
+                    <h3>Cropped Passport Photo (35mm x 45mm, 600 DPI)</h3>
+                    <div style={canvasWrapperStyle}>
+                        <canvas ref={croppedCanvasRef} style={canvasStyle} />
+                    </div>
+                </div>
+            </div>
+
+            <div style={inputContainerStyle}>
+                <button
+                    onClick={handleDownload}
+                    disabled={!faceDetection || isLoading}
+                    style={downloadButtonStyle}
+                >
+                    Download Passport Photo
+                </button>
+            </div>
+            <p style={noteStyle}>
+                * Upload a high-resolution image with clear, frontal face and good lighting.  Make sure you are looking straight at the camera.
+            </p>
+        </div>
+    );
+};
+
+export default PakistaniPassportPhotoEditor;
